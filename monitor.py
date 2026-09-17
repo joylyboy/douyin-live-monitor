@@ -32,6 +32,8 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Geck
 # 主页短链且没写 name 时，会自动用 sec_uid 反查到的昵称。
 SOURCES = [
     {"url": "https://live.douyin.com/125093611494", "name": "子成老师讲家庭教育"},
+    {"url": "https://v.douyin.com/1_AyxhJoFkc/", "name": "文琦赏茶"},
+    {"url": "https://live.douyin.com/896112721099", "name": "羽川电商"},
     # {"url": "https://live.douyin.com/yall1102", "name": "yall1102 主播"},
     # {"url": "https://v.douyin.com/CeiU5cbX", "name": "喜剧电影笑不停"},
 ]
