@@ -1,0 +1,8 @@
+# 抖音直播间监控列表 —— 改这里即可，无需碰 monitor.py
+# 格式：直播间链接或标识, 显示名（显示名可省略）
+# 支持：数字房号/抖音号、live.douyin.com/xxx、v.douyin.com/xxx 短链
+# # 开头为注释，空行忽略
+
+https://live.douyin.com/125093611494, 子成老师讲家庭教育
+https://v.douyin.com/1_AyxhJoFkc/, 羽川电商
+https://live.douyin.com/896112721099, 文琦赏茶
