@@ -23,20 +23,41 @@ BARK_SOUND = "tiptoes"
 UA = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/116.0.5845.97 Safari/537.36 Core/1.116.567.400 QQBrowser/19.7.6764.400")
 
-# ============ 直播间配置：在这里加一行即可 ============
-# 支持三种写法（任选其一），脚本会自动识别并归一为直播间标识：
-#   1) 数字房间号 / 抖音号(用户名)： "125093611494" 或 "yall1102"
-#   2) 直播间链接：                 "https://live.douyin.com/yall1102"
-#   3) 主页/分享短链：               "https://v.douyin.com/CeiU5cbX"
-# 推荐写成 {"url": "...", "name": "昵称"}，这样通知里显示你指定的名字；
-# 主页短链且没写 name 时，会自动用 sec_uid 反查到的昵称。
-SOURCES = [
+# ============ 直播间配置：只改 rooms.txt，不用碰本文件 ============
+# rooms.txt 每行一个房间，格式：  直播间链接或标识, 显示名
+#   例： https://live.douyin.com/125093611494, 子成老师讲家庭教育
+#   显示名可省略（短链会自动用 sec_uid 反查昵称）
+#   支持：数字房号/抖音号、live.douyin.com/xxx、v.douyin.com/xxx 短链
+#   # 开头为注释，空行忽略
+# 注意：rooms.txt 必须随仓库提交，CI 才能读到。
+ROOMS_FILE = "rooms.txt"
+# 兜底默认（仅当 rooms.txt 缺失时使用，避免本地直接跑报错）
+FALLBACK_SOURCES = [
     {"url": "https://live.douyin.com/125093611494", "name": "子成老师讲家庭教育"},
-    {"url": "https://v.douyin.com/1_AyxhJoFkc/", "name": "文琦赏茶"},
-    {"url": "https://live.douyin.com/896112721099", "name": "羽川电商"},
-    # {"url": "https://live.douyin.com/yall1102", "name": "yall1102 主播"},
-    # {"url": "https://v.douyin.com/CeiU5cbX", "name": "喜剧电影笑不停"},
 ]
+
+
+def load_sources():
+    """从 rooms.txt 读取监控列表；缺失则回退到 FALLBACK_SOURCES。"""
+    try:
+        with open(ROOMS_FILE, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return FALLBACK_SOURCES
+    out = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        if "," in ln:
+            url, name = ln.split(",", 1)
+            out.append({"url": url.strip(), "name": name.strip()})
+        else:
+            out.append({"url": ln, "name": ""})
+    return out or FALLBACK_SOURCES
+
+
+SOURCES = load_sources()
 
 
 def new_session():
