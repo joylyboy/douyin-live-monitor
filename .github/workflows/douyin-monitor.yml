@@ -1,0 +1,41 @@
+name: Douyin Live Monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'        # 每 5 分钟（GitHub 用 UTC，全天覆盖早晚时段）
+  workflow_dispatch:             # 手动触发测试
+
+concurrency:
+  group: douyin-monitor
+  cancel-in-progress: false     # 防止两次运行同时 push state.json 冲突
+
+permissions:
+  contents: write               # 用于提交 state.json
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install curl_cffi tzdata
+
+      - name: Run monitor
+        env:
+          BARK_KEY: ${{ secrets.BARK_KEY }}   # 只需这 1 个 Secret
+        run: python monitor.py
+
+      - name: Commit state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json || true
+          git diff --staged --quiet || git commit -m "chore: update live status"
+          git push
