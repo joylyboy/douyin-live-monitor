@@ -140,6 +140,19 @@ def build_targets():
 # 真实直播流地址：离线房间页面里这些计数为 0，直播房间大量出现（已用两个房间对比验证）
 STREAM_RE = re.compile(r'https?://[^\s"\'\\<>]+?\.(?:m3u8|flv)')
 
+# 从直播间网页 SSR 中提取真实的 room_id / user_id，用于构造唤起 App 的 URL Scheme
+# 兼容页面的 room_id / roomId / user_id / userId 等多种写法
+ROOM_ID_RE = re.compile(r'room_?id["\']?\s*[:=]\s*"?(\d{6,})"?', re.IGNORECASE)
+USER_ID_RE = re.compile(r'user_?id["\']?\s*[:=]\s*"?(\d{6,})"?', re.IGNORECASE)
+
+
+def extract_room_info(t):
+    """从直播间网页 HTML 中提取 (room_id, user_id)，取不到返回 (None, None)。"""
+    rid = ROOM_ID_RE.search(t)
+    uid = USER_ID_RE.search(t)
+    return (rid.group(1) if rid else None,
+            uid.group(1) if uid else None)
+
 
 def get_live_via_page(s, identifier):
     """主方法：抓直播间网页，用“真实直播流地址(m3u8/flv)是否存在”判直播。
@@ -152,16 +165,16 @@ def get_live_via_page(s, identifier):
                   headers={"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"},
                   timeout=15)
         if r.status_code != 200:
-            return None
+            return None, None, None
         t = r.text
         if len(t) < 50000:        # 疑似被 WAF 拦截/重定向的短页面，不误判为下播
-            return None
+            return None, None, None
         if STREAM_RE.search(t) or 'pull_url' in t:
-            return True
-        return False               # 页面正常返回但无任何流地址 → 未开播
+            return True, *extract_room_info(t)
+        return False, None, None               # 页面正常返回但无任何流地址 → 未开播
     except Exception as e:
         print(f"[{identifier}] page parse error: {e}")
-        return None
+        return None, None, None
 
 
 def get_live_via_api(s, identifier):
@@ -196,11 +209,15 @@ def get_live_via_api(s, identifier):
 
 
 def get_live_status(identifier, s):
-    """先试网页解析（稳），失败再试 API（兜底）。都拿不到返回 None（防误报：本次不通知）。"""
-    v = get_live_via_page(s, identifier)
+    """先试网页解析（稳），失败再试 API（兜底）。都拿不到返回 None（防误报：本次不通知）。
+    返回 (is_live, room_id, user_id)：room_id/user_id 用于构造唤起 App 的 Scheme。"""
+    v, rid, uid = get_live_via_page(s, identifier)
     if v is not None:
-        return v
-    return get_live_via_api(s, identifier)
+        return v, rid, uid
+    a = get_live_via_api(s, identifier)
+    if a is not None:
+        return a, None, None
+    return None, None, None
 
 
 def load_state():
@@ -216,13 +233,29 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def send_bark(title, body):
+def build_open_url(room_id, user_id, identifier):
+    """构造点击 Bark 通知后跳转到对应直播间的地址。
+    - 能拿到真实 room_id 时，优先用 iOS 的 aweme:// Scheme 直接唤起抖音进入直播间；
+    - 兜底用 live.douyin.com 网页链接（Safari 再唤起 App，多一步但更稳）。
+    安卓端可把 aweme 换成 snssdk1128。"""
+    if room_id:
+        q = f"room_id={room_id}"
+        if user_id:
+            q += f"&user_id={user_id}"
+        q += "&from=webview&refer=web"
+        return "aweme://live?" + q
+    return f"https://live.douyin.com/{identifier}"
+
+
+def send_bark(title, body, open_url=None):
     if not BARK_KEY:
         print(f"[bark skipped] {title} / {body}")
         return
     url = (f"https://api.day.app/{BARK_KEY}/"
            f"{quote(title, safe='')}/{quote(body, safe='')}"
            f"?sound={BARK_SOUND}&icon={quote(BARK_ICON, safe='')}")
+    if open_url:                       # 点击通知跳转：URL Scheme 唤起抖音进直播间
+        url += f"&url={quote(open_url, safe='')}"
     for _ in range(3):                 # 失败重试，避免漏通知
         try:
             if Session().get(url, timeout=5).status_code == 200:
@@ -241,16 +274,17 @@ def main():
 
     for ident, name in build_targets():
         prev = rooms_state.get(ident, {}).get("is_live", False)
-        current = get_live_status(ident, s)
+        current, room_id, user_id = get_live_status(ident, s)
         if current is None:
             print(f"[{name}] 状态获取失败/无法判定，跳过")   # 防误报：不更新、不通知
             continue
         entry = rooms_state.setdefault(ident, {"name": name, "is_live": False})
         if not first_run:              # 首次只记录，避免部署瞬间误报
+            open_url = build_open_url(room_id, user_id, ident)
             if not prev and current:
-                send_bark(f"{hhmm}开播", f"直播间({name})")
+                send_bark(f"{hhmm}开播", f"直播间({name})", open_url)
             elif prev and not current:
-                send_bark(f"{hhmm}下播", f"直播间({name})")
+                send_bark(f"{hhmm}下播", f"直播间({name})", open_url)
         entry.update({"name": name, "is_live": current,
                       "last_change": now.isoformat()})
 
