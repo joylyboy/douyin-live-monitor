@@ -2,7 +2,7 @@ name: Douyin Live Monitor
 
 on:
   schedule:
-    - cron: '*/5 * * * *'        # 每 5 分钟（GitHub 用 UTC；通知时间已是北京时间）
+    - cron: '2-57/5 1-13 * * *'      # 北京 09:00-21:00 每 5 分钟（UTC 1-13 时）
   workflow_dispatch:             # 手动触发测试
 
 concurrency:
