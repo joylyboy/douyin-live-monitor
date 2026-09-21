@@ -71,6 +71,50 @@ def normalize_source(src):
     return src, ""
 
 
+def _extract_secuid(s):
+    """从文本/URL 抽 sec_uid：兼容 查询形式(sec_uid=xxx) 与 路径形式
+    (www.douyin.com/user/xxx 或 www.iesdouyin.com/share/user/xxx)。"""
+    if not s:
+        return None
+    m = re.search(r"sec_uid=([^&\s\"'<>]+)", s)
+    if m:
+        return m.group(1)
+    m = re.search(r"(?:douyin\.com/user|iesdouyin\.com/share/user)/([^/?#\"'<>]+)", s)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _extract_live_id(s):
+    """从文本/URL 抽 live.douyin.com 房间标识，过滤 reflow 等非房号串；
+    仅当标识为纯数字（真实房号）时才返回，避免把 sec_uid 误当房号。"""
+    if not s:
+        return None
+    m = re.search(r"live\.douyin\.com/([^/?#\"'<>]+)", s)
+    if m and m.group(1) not in ("", "reflow") and m.group(1).isdigit():
+        return m.group(1)
+    return None
+
+
+def _room_id_from_secuid(sec_uid):
+    """sec_uid → 真实数字房号（用户当前在播时最准），拿不到返回 None。
+    注意：live.douyin.com/{sec_uid} 页面在离线时 roomId 为 $undefined、web_rid 是模板常量，
+    因此只在能抽到真实数字房号时才返回，否则回退到用 sec_uid 监控。"""
+    try:
+        r = new_session().get(f"https://live.douyin.com/{sec_uid}",
+                              headers={"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"},
+                              timeout=20, allow_redirects=True)
+        rid = _extract_live_id(r.url)
+        if rid:
+            return rid
+        rid = ROOM_ID_RE.search(r.text)
+        if rid:
+            return rid.group(1)
+    except Exception as e:
+        print(f"[resolve] sec_uid={sec_uid} 解析 room_id 失败: {e}")
+    return None
+
+
 def resolve_identifier(raw):
     """把任意输入（数字/用户名/完整链接）归一为 live.douyin.com 用的标识符。
     返回 (identifier, sec_uid_or_None)。识别不出返回 (None, None)。"""
@@ -78,16 +122,24 @@ def resolve_identifier(raw):
     if not raw:
         return None, None
     if raw.startswith("http"):
-        # 主页/分享短链：跟重定向拿 sec_uid
-        if "v.douyin.com" in raw or "iesdouyin.com/share/user" in raw:
+        # v.douyin.com / iesdouyin 分享短链：跟重定向。抖音短链走 meta/JS 跳转，
+        # curl_cffi 的 r.url 可能仍停在短链上，所以要同时查 r.url 与 r.text。
+        if "v.douyin.com" in raw or "iesdouyin.com/share" in raw:
             try:
-                r = new_session().get(raw, headers={"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"},
+                r = new_session().get(raw, headers={"User-Agent": UA,
+                                                    "Accept-Language": "zh-CN,zh;q=0.9"},
                                       timeout=20, allow_redirects=True)
-                m = re.search(r"sec_uid=([^&\s]+)", r.url)
-                if m:
-                    return m.group(1), m.group(1)
+                live_id = _extract_live_id(r.url) or _extract_live_id(r.text)
+                if live_id:
+                    return live_id, None                 # 短链直达直播间，最稳
+                sec = _extract_secuid(r.url) or _extract_secuid(r.text)
+                if sec:
+                    rid = _room_id_from_secuid(sec)
+                    if rid:
+                        return rid, None                 # 成功解析成真实房号
+                    return sec, sec                       # 兜底：用 sec_uid 监控
             except Exception as e:
-                print(f"[resolve] {raw} 重定向解析失败: {e}")
+                print(f"[resolve] {raw} 短链解析失败: {e}")
             return None, None
         # 直播间链接 live.douyin.com/xxx
         m = re.search(r"live\.douyin\.com/([^/?#]+)", raw)
