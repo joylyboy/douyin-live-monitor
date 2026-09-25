@@ -96,25 +96,6 @@ def _extract_live_id(s):
     return None
 
 
-def _room_id_from_secuid(sec_uid):
-    """sec_uid → 真实数字房号（用户当前在播时最准），拿不到返回 None。
-    注意：live.douyin.com/{sec_uid} 页面在离线时 roomId 为 $undefined、web_rid 是模板常量，
-    因此只在能抽到真实数字房号时才返回，否则回退到用 sec_uid 监控。"""
-    try:
-        r = new_session().get(f"https://live.douyin.com/{sec_uid}",
-                              headers={"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"},
-                              timeout=20, allow_redirects=True)
-        rid = _extract_live_id(r.url)
-        if rid:
-            return rid
-        rid = ROOM_ID_RE.search(r.text)
-        if rid:
-            return rid.group(1)
-    except Exception as e:
-        print(f"[resolve] sec_uid={sec_uid} 解析 room_id 失败: {e}")
-    return None
-
-
 def resolve_identifier(raw):
     """把任意输入（数字/用户名/完整链接）归一为 live.douyin.com 用的标识符。
     返回 (identifier, sec_uid_or_None)。识别不出返回 (None, None)。"""
@@ -129,15 +110,15 @@ def resolve_identifier(raw):
                 r = new_session().get(raw, headers={"User-Agent": UA,
                                                     "Accept-Language": "zh-CN,zh;q=0.9"},
                                       timeout=20, allow_redirects=True)
+                # 短链若直接跳到直播间(live.douyin.com/数字)，直接用数字房号最稳
                 live_id = _extract_live_id(r.url) or _extract_live_id(r.text)
                 if live_id:
-                    return live_id, None                 # 短链直达直播间，最稳
+                    return live_id, None
+                # 否则拿到 sec_uid，交给监控阶段：用户开播时抖音会把 sec_uid 页面
+                # 重定向到 live.douyin.com/{数字房号}，那时我们再锁定数字房号长期监控
                 sec = _extract_secuid(r.url) or _extract_secuid(r.text)
                 if sec:
-                    rid = _room_id_from_secuid(sec)
-                    if rid:
-                        return rid, None                 # 成功解析成真实房号
-                    return sec, sec                       # 兜底：用 sec_uid 监控
+                    return sec, sec
             except Exception as e:
                 print(f"[resolve] {raw} 短链解析失败: {e}")
             return None, None
@@ -173,7 +154,8 @@ def get_nickname_by_secuid(sec_uid):
 
 
 def build_targets():
-    """把 SOURCES 解析成 [(identifier, display_name), ...]。"""
+    """把 SOURCES 解析成 [(identifier, display_name, sec_uid), ...]。
+    sec_uid 仅对 v.douyin.com 短链房间非空，用于监控时锁定其真实数字房号。"""
     targets = []
     for src in SOURCES:
         url, name = normalize_source(src)
@@ -185,7 +167,7 @@ def build_targets():
             name = get_nickname_by_secuid(sec_uid) or ident
         elif not name:
             name = ident
-        targets.append((ident, name))
+        targets.append((ident, name, sec_uid))
     return targets
 
 
@@ -211,22 +193,34 @@ def get_live_via_page(s, identifier):
     关键发现：抖音网页 SSR 的 liveStatus 字段对【正在直播】的房间也返回 'normal'（不可信）。
     但离线房间页面里 m3u8/flv/pull_url 等流地址计数为 0，直播房间则大量存在。
     因此以“页面含真实流地址”作为在播的可靠信号；页面取不到或异常则返回 None（防误报）。
-    identifier 可以是数字房间号、抖音号(用户名)或 sec_uid——live.douyin.com 都能解析。"""
+    identifier 可以是数字房间号、抖音号(用户名)或 sec_uid。
+    返回 (is_live, room_id, user_id, resolved_room_id)：
+      resolved_room_id 是抖音把 sec_uid 用户页重定向到 live.douyin.com/{数字} 时抽到的真实房号，
+      用于把短链房间锁定为数字房号长期监控。"""
     try:
         r = s.get(f"https://live.douyin.com/{identifier}",
                   headers={"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"},
                   timeout=15)
         if r.status_code != 200:
-            return None, None, None
+            return None, None, None, None
         t = r.text
         if len(t) < 50000:        # 疑似被 WAF 拦截/重定向的短页面，不误判为下播
-            return None, None, None
+            return None, None, None, None
+        # 抖音开播时会把 sec_uid 用户页 301 到 live.douyin.com/{数字房号}，
+        # 这里从最终 URL 抽出真实房号（关键：短链房间只有开播那一刻才暴露数字房号）
+        resolved = None
+        m = re.search(r"live\.douyin\.com/(\d{6,})", r.url)
+        if m:
+            resolved = m.group(1)
         if STREAM_RE.search(t) or 'pull_url' in t:
-            return True, *extract_room_info(t)
-        return False, None, None               # 页面正常返回但无任何流地址 → 未开播
+            rid, uid = extract_room_info(t)
+            if not rid and resolved:
+                rid = resolved
+            return True, rid, uid, resolved
+        return False, None, None, resolved     # 页面正常返回但无任何流地址 → 未开播
     except Exception as e:
         print(f"[{identifier}] page parse error: {e}")
-        return None, None, None
+        return None, None, None, None
 
 
 def get_live_via_api(s, identifier):
@@ -262,14 +256,14 @@ def get_live_via_api(s, identifier):
 
 def get_live_status(identifier, s):
     """先试网页解析（稳），失败再试 API（兜底）。都拿不到返回 None（防误报：本次不通知）。
-    返回 (is_live, room_id, user_id)：room_id/user_id 用于构造唤起 App 的 Scheme。"""
-    v, rid, uid = get_live_via_page(s, identifier)
+    返回 (is_live, room_id, user_id, resolved_room_id)。"""
+    v, rid, uid, resolved = get_live_via_page(s, identifier)
     if v is not None:
-        return v, rid, uid
+        return v, rid, uid, resolved
     a = get_live_via_api(s, identifier)
     if a is not None:
-        return a, None, None
-    return None, None, None
+        return a, None, None, None
+    return None, None, None, None
 
 
 def load_state():
@@ -320,19 +314,27 @@ def send_bark(title, body, open_url=None):
 def main():
     state, first_run = load_state()
     rooms_state = state.setdefault("rooms", {})
+    secuid_map = state.setdefault("secuid_map", {})   # sec_uid -> 数字房号（开播时锁定）
     s = new_session()                  # 单会话：首次访问网页会自动种下 ttwid 等 cookie
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
     hhmm = now.strftime("%H:%M")       # 北京时间
 
-    for ident, name in build_targets():
-        prev = rooms_state.get(ident, {}).get("is_live", False)
-        current, room_id, user_id = get_live_status(ident, s)
+    for ident, name, sec_uid in build_targets():
+        # 短链(sec_uid)房间：优先用已锁定的数字房号监控（数字房号这条路 100% 可靠）
+        effective = ident
+        if sec_uid and secuid_map.get(sec_uid):
+            effective = secuid_map[sec_uid]
+        current, room_id, user_id, resolved = get_live_status(effective, s)
         if current is None:
             print(f"[{name}] 状态获取失败/无法判定，跳过")   # 防误报：不更新、不通知
             continue
+        # 监控过程中若发现 sec_uid 对应的真实数字房号（开播重定向曝光），永久缓存
+        if sec_uid and resolved and resolved != sec_uid:
+            secuid_map[sec_uid] = resolved
+        prev = rooms_state.get(ident, {}).get("is_live", False)
         entry = rooms_state.setdefault(ident, {"name": name, "is_live": False})
         if not first_run:              # 首次只记录，避免部署瞬间误报
-            open_url = build_open_url(room_id, user_id, ident)
+            open_url = build_open_url(room_id, user_id, effective)
             if not prev and current:
                 send_bark(f"{hhmm}开播", f"直播间({name})", open_url)
             elif prev and not current:
