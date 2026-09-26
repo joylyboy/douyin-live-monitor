@@ -1,6 +1,6 @@
 # 抖音直播间开播监控
 
-自动监控一批抖音直播间，一旦开播 / 下播就通过 Bark 推送到 iPhone。点击通知可直接用 `aweme://` Scheme 唤起抖音进入对应直播间。
+自动监控一批抖音直播间，一旦开播 / 下播就通过 Bark 推送到 iPhone。点击通知可直接用抖音 URL Scheme（`snssdk1128://live`）唤起抖音进入对应直播间。
 
 ## 工作原理
 
@@ -39,7 +39,7 @@ flowchart LR
 - 支持：
   - 纯数字房间号 / 抖音号（用户名）
   - `live.douyin.com/房间号`
-  - `v.douyin.com/xxxx` 分享短链（自动跟重定向拿 room_id 或 sec_uid，已修复此前不生效的问题）
+  - `v.douyin.com/xxxx` 分享短链（自动解析；开播时会捕获抖音跳转出的真实数字房号并锁定，之后按数字房号稳定监控）
   - `www.douyin.com/user/xxx` 主页链接
 - `#` 开头为注释，空行忽略。
 - 修改后需提交到仓库，CI 才能读到。
@@ -53,8 +53,7 @@ flowchart LR
 ## 通知（Bark）
 
 - 监控到开播 / 下播时，向 Bark 推送标题 `HH:MM开播` / `HH:MM下播`，正文为直播间名。
-- 点击通知会用 iOS 的 `aweme://live?room_id=...` Scheme 直接唤起抖音进入对应直播间；拿不到 room_id 时回退到 `https://live.douyin.com/房间号` 网页链接。
-- 安卓端可把 `aweme` 换成 `snssdk1128`。
+- 点击通知会用抖音 URL Scheme `snssdk1128://live?room_id=...&user_id=...` 直接唤起抖音 App 进入对应直播间（实测 `aweme://` 在部分 iOS 上无法打开，故默认用 `snssdk1128`）；拿不到 room_id 时回退到 `https://live.douyin.com/房间号` 网页链接。
 - Bark 的 key 通过仓库 Secrets（`BARK_KEY`）注入，不在代码里硬编码。
 
 ## 调度
@@ -70,7 +69,7 @@ flowchart LR
 - **某房间一直「无法识别的源 / 状态获取失败」**：URL 可能已失效或短链重定向异常。可临时换成 `live.douyin.com/房间号` 直链验证。
 - **从不推送开播**：检查 Bark key（Secrets `BARK_KEY`）是否正确；本地直接跑 `python monitor.py` 看日志，`[bark skipped]` 表示未配置 key。
 - **页面被 WAF 拦截（<50000 字符短页面）**：代码判为「无法判定」跳过，不误报；一般重试即可恢复。
-- **v.douyin.com 短链不生效**：已修复——现自动跟重定向，从跳转结果中拿 room_id 或 sec_uid（兼容 `sec_uid=` 查询参数与 `share/user/`、`douyin.com/user/` 路径两种形式），不再只认 `sec_uid=` 查询参数；并优先在用户开播时解析出真实数字房号用于监控。
+- **v.douyin.com 短链（非 live 链接）一开始不推送开播**：这类链接本质是用户主页，离线时页面没有数字房号、也没有直播流，无法直接监控。监控脚本会在该用户**首次开播**时捕获抖音跳转出来的真实数字房号（`live.douyin.com/{数字}`）并永久锁定，之后按数字房号稳定监控。即：添加后第一次开播必被捕获，此前不会误报。
 
 ## 备注
 
