@@ -188,6 +188,30 @@ def extract_room_info(t):
             uid.group(1) if uid else None)
 
 
+def _extract_redirect_to_room(t):
+    """从 sec_uid 用户页 HTML 中抽出「页面级跳转」目标数字房号。
+    抖音开播时常把 live.douyin.com/{sec_uid} 用 meta refresh 或 JS location 跳到
+    live.douyin.com/{数字房号}；curl_cffi 不跟 JS 跳转，这里手动识别。
+    只认「页面级导航」(meta refresh / window.location 等)，不认侧边栏 <a> 链接，避免误匹配。"""
+    if not t:
+        return None
+    # 1) <meta http-equiv="refresh" ... url=...>
+    m = re.search(r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]*url=["\']?([^"\'>\s]+)', t, re.IGNORECASE)
+    if m:
+        rm = re.search(r"live\.douyin\.com/(\d{6,})", m.group(1))
+        if rm:
+            return rm.group(1)
+    # 2) JS 显式跳转：window.location / location.href / document.location = "...live.douyin.com/数字"
+    for kw in (r"window\.location", r"location\.href", r"document\.location",
+               r"self\.location", r"top\.location"):
+        m = re.search(kw + r"\s*=\s*[\"']([^\"']*live\.douyin\.com/\d{6,}[^\"']*)[\"']", t)
+        if m:
+            rm = re.search(r"live\.douyin\.com/(\d{6,})", m.group(1))
+            if rm:
+                return rm.group(1)
+    return None
+
+
 def get_live_via_page(s, identifier):
     """主方法：抓直播间网页，用“真实直播流地址(m3u8/flv)是否存在”判直播。
     关键发现：抖音网页 SSR 的 liveStatus 字段对【正在直播】的房间也返回 'normal'（不可信）。
@@ -195,8 +219,8 @@ def get_live_via_page(s, identifier):
     因此以“页面含真实流地址”作为在播的可靠信号；页面取不到或异常则返回 None（防误报）。
     identifier 可以是数字房间号、抖音号(用户名)或 sec_uid。
     返回 (is_live, room_id, user_id, resolved_room_id)：
-      resolved_room_id 是抖音把 sec_uid 用户页重定向到 live.douyin.com/{数字} 时抽到的真实房号，
-      用于把短链房间锁定为数字房号长期监控。"""
+      resolved_room_id 是抖音把 sec_uid 用户页跳转/重定向到 live.douyin.com/{数字} 时抽到的真实房号，
+      用于把短链房间锁定为数字房号长期监控（短链房间只有开播那一刻才暴露数字房号）。"""
     try:
         r = s.get(f"https://live.douyin.com/{identifier}",
                   headers={"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"},
@@ -206,17 +230,35 @@ def get_live_via_page(s, identifier):
         t = r.text
         if len(t) < 50000:        # 疑似被 WAF 拦截/重定向的短页面，不误判为下播
             return None, None, None, None
-        # 抖音开播时会把 sec_uid 用户页 301 到 live.douyin.com/{数字房号}，
-        # 这里从最终 URL 抽出真实房号（关键：短链房间只有开播那一刻才暴露数字房号）
+        # HTTP 重定向后的真实房号（如 301 到 live.douyin.com/{数字}）
         resolved = None
         m = re.search(r"live\.douyin\.com/(\d{6,})", r.url)
         if m:
             resolved = m.group(1)
+        # 当前页本身就是在播直播间（数字房号页，或 sec_uid 页直接渲染了直播间）
         if STREAM_RE.search(t) or 'pull_url' in t:
             rid, uid = extract_room_info(t)
             if not rid and resolved:
                 rid = resolved
             return True, rid, uid, resolved
+        # 当前页无流：可能是 sec_uid 用户页被「页面级跳转」到了数字房号直播间。
+        # 手动解析跳转目标并去目标页复核，确保在播瞬间也能锁定真实房号。
+        target = _extract_redirect_to_room(t)
+        if target and target != str(identifier):
+            try:
+                r2 = s.get(f"https://live.douyin.com/{target}",
+                           headers={"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"},
+                           timeout=15)
+                if r2.status_code == 200 and len(r2.text) >= 50000:
+                    if STREAM_RE.search(r2.text) or 'pull_url' in r2.text:
+                        rid, uid = extract_room_info(r2.text)
+                        if not rid:
+                            rid = target
+                        return True, rid, uid, target
+                    # 目标页存在但当前未播：数字房号稳定，缓存以便后续直接监控（更稳）
+                    return False, None, None, target
+            except Exception as e:
+                print(f"[{identifier}] follow redirect to {target} error: {e}")
         return False, None, None, resolved     # 页面正常返回但无任何流地址 → 未开播
     except Exception as e:
         print(f"[{identifier}] page parse error: {e}")
@@ -225,7 +267,8 @@ def get_live_via_page(s, identifier):
 
 def get_live_via_api(s, identifier):
     """兜底方法：webcast/room/web/enter（a_bogus 签名）。
-    部分网络环境（如某些住宅 IP）可用；被风控的 IP 会返回空 body，此时返回 None。"""
+    部分网络环境（如某些住宅 IP）可用；被风控的 IP 会返回空 body，此时返回 None。
+    返回 (is_live, room_id)：拿不到 is_live 时两者都返回 None。"""
     try:
         params = {
             "aid": "6383", "app_name": "douyin_web", "live_id": "1",
@@ -243,15 +286,17 @@ def get_live_via_api(s, identifier):
             "Accept": "application/json, text/plain, */*",
         }, timeout=15)
         if r.status_code != 200 or not r.text.strip():
-            return None
+            return None, None
         data = r.json().get("data", {})
         arr = data.get("data")
         if isinstance(arr, list) and arr:
-            return arr[0].get("status") == 2
-        return None
+            item = arr[0]
+            rid = item.get("room_id") or item.get("id")
+            return item.get("status") == 2, (str(rid) if rid else None)
+        return None, None
     except Exception as e:
         print(f"[{identifier}] api error: {e}")
-        return None
+        return None, None
 
 
 def get_live_status(identifier, s):
@@ -260,9 +305,9 @@ def get_live_status(identifier, s):
     v, rid, uid, resolved = get_live_via_page(s, identifier)
     if v is not None:
         return v, rid, uid, resolved
-    a = get_live_via_api(s, identifier)
+    a, a_rid = get_live_via_api(s, identifier)
     if a is not None:
-        return a, None, None, None
+        return a, a_rid, None, a_rid
     return None, None, None, None
 
 
@@ -281,15 +326,14 @@ def save_state(state):
 
 def build_open_url(room_id, user_id, identifier):
     """构造点击 Bark 通知后跳转到对应直播间的地址。
-    - 能拿到真实 room_id 时，优先用 iOS 的 aweme:// Scheme 直接唤起抖音进入直播间；
-    - 兜底用 live.douyin.com 网页链接（Safari 再唤起 App，多一步但更稳）。
-    安卓端可把 aweme 换成 snssdk1128。"""
+    - 能拿到真实 room_id 时，优先用抖音 URL Scheme 直接唤起 App 进入直播间：
+      snssdk1128://live?room_id=X&user_id=Y（iOS / 安卓通用，实测 aweme:// 在部分 iOS 上无法打开）。
+    - 兜底用 live.douyin.com 网页链接（Safari/浏览器再唤起 App，多一步但更稳）。"""
     if room_id:
         q = f"room_id={room_id}"
         if user_id:
             q += f"&user_id={user_id}"
-        q += "&from=webview&refer=web"
-        return "aweme://live?" + q
+        return "snssdk1128://live?" + q
     return f"https://live.douyin.com/{identifier}"
 
 
@@ -328,9 +372,12 @@ def main():
         if current is None:
             print(f"[{name}] 状态获取失败/无法判定，跳过")   # 防误报：不更新、不通知
             continue
-        # 监控过程中若发现 sec_uid 对应的真实数字房号（开播重定向曝光），永久缓存
-        if sec_uid and resolved and resolved != sec_uid:
-            secuid_map[sec_uid] = resolved
+        # 监控过程中若发现 sec_uid 对应的真实数字房号（开播跳转/页面曝光），永久缓存，
+        # 之后直接用数字房号监控（这条路 100% 可靠），摆脱不稳定的 sec_uid 用户页。
+        if sec_uid:
+            rid_candidate = resolved or (room_id if room_id and room_id.isdigit() else None)
+            if rid_candidate and rid_candidate != sec_uid:
+                secuid_map[sec_uid] = rid_candidate
         prev = rooms_state.get(ident, {}).get("is_live", False)
         entry = rooms_state.setdefault(ident, {"name": name, "is_live": False})
         if not first_run:              # 首次只记录，避免部署瞬间误报
