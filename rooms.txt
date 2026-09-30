@@ -3,7 +3,7 @@
 # 支持：数字房号/抖音号、live.douyin.com/xxx、v.douyin.com/xxx 短链
 # # 开头为注释，空行忽略
 
-https://live.douyin.com/125093611494, 子成老师讲家庭教育
+https://live.douyin.com/125093611494?room_id=7691092588308351771, 子成老师讲家庭教育
 https://live.douyin.com/896112721099, 文琦赏茶
 https://live.douyin.com/75275341661, 陈灿平博士
 https://live.douyin.com/553788453472?room_id=7690059980518869803, 懂茶帝
@@ -19,5 +19,4 @@ https://v.douyin.com/YaGB65VeBfY/, 柠檬的茶道
 https://v.douyin.com/Nse1nSSN36g/, 丹妮茶叶
 https://v.douyin.com/960x6uEynNY/, 佳长无忧
 https://v.douyin.com/RPxs_TfrsZ4/, 佳长教育
-
 https://live.douyin.com/481049053245, 静萱茶事
