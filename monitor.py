@@ -96,12 +96,23 @@ def _extract_live_id(s):
     return None
 
 
+def query_room_id(s):
+    """从链接查询串里取用户显式提供的真实房号 ?room_id=xxxxx（19 位长号）。
+    rooms.txt 里写成 https://live.douyin.com/125093611494?room_id=7691462265979194153 时，
+    旧代码用 live\\.douyin\\.com/([^/?#]+) 只取路径 125093611494，把这段整丢了。"""
+    if not s:
+        return None
+    m = re.search(r"[?&]room_id=(\d{6,})", s)
+    return m.group(1) if m else None
+
+
 def resolve_identifier(raw):
     """把任意输入（数字/用户名/完整链接）归一为 live.douyin.com 用的标识符。
-    返回 (identifier, sec_uid_or_None)。识别不出返回 (None, None)。"""
+    返回 (identifier, sec_uid_or_None, room_id_or_None)。识别不出返回 (None, None, None)。
+    注意：identifier 是 web_rid（稳定），room_id 是真实房号（每次开播会轮换），二者用途不同。"""
     raw = (raw or "").strip()
     if not raw:
-        return None, None
+        return None, None, None
     if raw.startswith("http"):
         # v.douyin.com / iesdouyin 分享短链：跟重定向。抖音短链走 meta/JS 跳转，
         # curl_cffi 的 r.url 可能仍停在短链上，所以要同时查 r.url 与 r.text。
@@ -113,29 +124,29 @@ def resolve_identifier(raw):
                 # 短链若直接跳到直播间(live.douyin.com/数字)，直接用数字房号最稳
                 live_id = _extract_live_id(r.url) or _extract_live_id(r.text)
                 if live_id:
-                    return live_id, None
+                    return live_id, None, (query_room_id(r.url) or query_room_id(r.text))
                 # 否则拿到 sec_uid，交给监控阶段：用户开播时抖音会把 sec_uid 页面
                 # 重定向到 live.douyin.com/{数字房号}，那时我们再锁定数字房号长期监控
                 sec = _extract_secuid(r.url) or _extract_secuid(r.text)
                 if sec:
-                    return sec, sec
+                    return sec, sec, None
             except Exception as e:
                 print(f"[resolve] {raw} 短链解析失败: {e}")
-            return None, None
-        # 直播间链接 live.douyin.com/xxx
+            return None, None, None
+        # 直播间链接 live.douyin.com/xxx（可能带 ?room_id=真实房号）
         m = re.search(r"live\.douyin\.com/([^/?#]+)", raw)
         if m:
-            return m.group(1), None
+            return m.group(1), None, query_room_id(raw)
         # 主页链接 www.douyin.com/user/<sec_uid>
         m = re.search(r"douyin\.com/user/([^/?#]+)", raw)
         if m:
-            return m.group(1), m.group(1)
+            return m.group(1), m.group(1), query_room_id(raw)
         # 其它带 sec_uid 的链接
         m = re.search(r"sec_uid=([^&\s]+)", raw)
         if m:
-            return m.group(1), m.group(1)
+            return m.group(1), m.group(1), query_room_id(raw)
     # 纯数字房间号 / 抖音号(用户名)
-    return raw, None
+    return raw, None, None
 
 
 def get_nickname_by_secuid(sec_uid):
@@ -154,12 +165,13 @@ def get_nickname_by_secuid(sec_uid):
 
 
 def build_targets():
-    """把 SOURCES 解析成 [(identifier, display_name, sec_uid), ...]。
-    sec_uid 仅对 v.douyin.com 短链房间非空，用于监控时锁定其真实数字房号。"""
+    """把 SOURCES 解析成 [(identifier, display_name, sec_uid, room_id), ...]。
+    sec_uid 仅对 v.douyin.com 短链房间非空，用于监控时锁定其真实数字房号；
+    room_id 是 rooms.txt 里 ?room_id= 显式给出的真实房号（可能过期，仅作兜底）。"""
     targets = []
     for src in SOURCES:
         url, name = normalize_source(src)
-        ident, sec_uid = resolve_identifier(url)
+        ident, sec_uid, room_id = resolve_identifier(url)
         if not ident:
             print(f"[skip] 无法识别的源: {src}")
             continue
@@ -167,17 +179,22 @@ def build_targets():
             name = get_nickname_by_secuid(sec_uid) or ident
         elif not name:
             name = ident
-        targets.append((ident, name, sec_uid))
+        targets.append((ident, name, sec_uid, room_id))
     return targets
 
 
 # 真实直播流地址：离线房间页面里这些计数为 0，直播房间大量出现（已用两个房间对比验证）
 STREAM_RE = re.compile(r'https?://[^\s"\'\\<>]+?\.(?:m3u8|flv)')
 
-# 从直播间网页 SSR 中提取真实的 room_id / user_id，用于构造唤起 App 的 URL Scheme
-# 兼容页面的 room_id / roomId / user_id / userId 等多种写法
-ROOM_ID_RE = re.compile(r'room_?id["\']?\s*[:=]\s*"?(\d{6,})"?', re.IGNORECASE)
-USER_ID_RE = re.compile(r'user_?id["\']?\s*[:=]\s*"?(\d{6,})"?', re.IGNORECASE)
+# 从直播间网页 SSR 中提取真实的 room_id / user_id，用于构造唤起 App 的 URL Scheme。
+# 关键：抖音 SSR 里 JSON 的引号是「反斜杠转义」的，实际长这样：
+#   roomId\":\"7691834822100028170\",\"web_rid\":\"125093611494\"
+# 旧正则 room_?id["']?\s*[:=] 在 roomId\ 之后遇到反斜杠而非冒号 → 匹配失败，
+# 导致取不到真实房号、回退用 web_rid 当 room_id，推送的 Scheme 因此打不开。
+# 现在用 \s*\\?["']? 容忍转义引号。注意真实 room_id 是 19 位长号，
+# 而 live.douyin.com/{id} 路径里的 12 位是 web_rid，二者不同，不可混用。
+ROOM_ID_RE = re.compile(r'room_?id\s*\\?["\']?\s*[:=]\s*\\?["\']?(\d{6,})', re.IGNORECASE)
+USER_ID_RE = re.compile(r'user_?id\s*\\?["\']?\s*[:=]\s*\\?["\']?(\d{6,})', re.IGNORECASE)
 
 
 def extract_room_info(t):
@@ -186,6 +203,22 @@ def extract_room_info(t):
     uid = USER_ID_RE.search(t)
     return (rid.group(1) if rid else None,
             uid.group(1) if uid else None)
+
+
+def paired_room_id(t, web_rid):
+    """取与指定 web_rid 成对出现的真实 room_id（最准，避免误取推荐位房号）。
+    SSR 中结构为 roomId\":\"<真实房号>\",\"web_rid\":\"<web_rid>\"。"""
+    if not t or not web_rid:
+        return None
+    pat = (r'room_?id\s*\\?["\']?\s*[:=]\s*\\?["\']?(\d{6,})'
+           r'[^}]{0,120}?web_?rid\s*\\?["\']?\s*[:=]\s*\\?["\']?' + re.escape(str(web_rid)))
+    m = re.search(pat, t, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    pat2 = (r'web_?rid\s*\\?["\']?\s*[:=]\s*\\?["\']?' + re.escape(str(web_rid))
+            + r'[^}]{0,120}?room_?id\s*\\?["\']?\s*[:=]\s*\\?["\']?(\d{6,})')
+    m = re.search(pat2, t, re.IGNORECASE)
+    return m.group(1) if m else None
 
 
 def _extract_redirect_to_room(t):
@@ -238,8 +271,10 @@ def get_live_via_page(s, identifier):
         # 当前页本身就是在播直播间（数字房号页，或 sec_uid 页直接渲染了直播间）
         if STREAM_RE.search(t) or 'pull_url' in t:
             rid, uid = extract_room_info(t)
-            if not rid and resolved:
-                rid = resolved
+            prid = paired_room_id(t, identifier)   # 与本房间 web_rid 成对的房号，最准
+            rid = prid or rid
+            # 注意：绝不回退用 resolved(web_rid) 当 room_id——web_rid 与真实房号不同，
+            # 用它拼 Scheme 会导致推送点不开直播间（这正是之前的 bug）。
             return True, rid, uid, resolved
         # 当前页无流：可能是 sec_uid 用户页被「页面级跳转」到了数字房号直播间。
         # 手动解析跳转目标并去目标页复核，确保在播瞬间也能锁定真实房号。
@@ -252,14 +287,18 @@ def get_live_via_page(s, identifier):
                 if r2.status_code == 200 and len(r2.text) >= 50000:
                     if STREAM_RE.search(r2.text) or 'pull_url' in r2.text:
                         rid, uid = extract_room_info(r2.text)
-                        if not rid:
-                            rid = target
+                        prid = paired_room_id(r2.text, target)
+                        rid = prid or rid
                         return True, rid, uid, target
                     # 目标页存在但当前未播：数字房号稳定，缓存以便后续直接监控（更稳）
                     return False, None, None, target
             except Exception as e:
                 print(f"[{identifier}] follow redirect to {target} error: {e}")
-        return False, None, None, resolved     # 页面正常返回但无任何流地址 → 未开播
+        # 未开播：仍尝试取真实房号（实测离线页 SSR 里仍带该房间的 roomId），
+        # 供下播通知使用；取不到就是 None，build_open_url 会退回网页链接。
+        rid, uid = extract_room_info(t)
+        prid = paired_room_id(t, identifier)
+        return False, (prid or rid), uid, resolved
     except Exception as e:
         print(f"[{identifier}] page parse error: {e}")
         return None, None, None, None
@@ -363,8 +402,8 @@ def main():
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
     hhmm = now.strftime("%H:%M")       # 北京时间
 
-    for ident, name, sec_uid in build_targets():
-        # 短链(sec_uid)房间：优先用已锁定的数字房号监控（数字房号这条路 100% 可靠）
+    for ident, name, sec_uid, src_room_id in build_targets():
+        # 短链(sec_uid)房间：优先用已锁定的数字 web_rid 监控（数字房号这条路 100% 可靠）
         effective = ident
         if sec_uid and secuid_map.get(sec_uid):
             effective = secuid_map[sec_uid]
@@ -372,16 +411,20 @@ def main():
         if current is None:
             print(f"[{name}] 状态获取失败/无法判定，跳过")   # 防误报：不更新、不通知
             continue
-        # 监控过程中若发现 sec_uid 对应的真实数字房号（开播跳转/页面曝光），永久缓存，
-        # 之后直接用数字房号监控（这条路 100% 可靠），摆脱不稳定的 sec_uid 用户页。
-        if sec_uid:
-            rid_candidate = resolved or (room_id if room_id and room_id.isdigit() else None)
-            if rid_candidate and rid_candidate != sec_uid:
-                secuid_map[sec_uid] = rid_candidate
+        # 监控过程中若发现 sec_uid 对应的数字 web_rid（开播跳转曝光），永久缓存，
+        # 之后直接用数字房号监控，摆脱不稳定的 sec_uid 用户页。
+        # 注意：这里只能缓存 web_rid（URL 路径用的稳定标识），
+        # 绝不能把页面里的 19 位真实 room_id 当 web_rid 存进去（拼出的 URL 是无效的）。
+        if sec_uid and resolved and resolved.isdigit() and resolved != sec_uid:
+            secuid_map[sec_uid] = resolved
         prev = rooms_state.get(ident, {}).get("is_live", False)
         entry = rooms_state.setdefault(ident, {"name": name, "is_live": False})
         if not first_run:              # 首次只记录，避免部署瞬间误报
-            open_url = build_open_url(room_id, user_id, effective)
+            # Scheme 必须用「真实房号」(19 位) 才打得开：
+            # 优先用开播瞬间从页面取到的当前房号（每次开播会轮换，这个最准），
+            # 其次用 rooms.txt 里 ?room_id= 显式提供的；都没有才退回网页链接。
+            open_rid = room_id or src_room_id
+            open_url = build_open_url(open_rid, user_id, effective)
             if not prev and current:
                 send_bark(f"{hhmm}开播", f"直播间({name})", open_url)
             elif prev and not current:
